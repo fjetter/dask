@@ -2,13 +2,14 @@ from __future__ import absolute_import, division, print_function
 
 import numpy as np
 import pandas as pd
+import six
 
-from ..core import DataFrame, Series
-from ..utils import UNKNOWN_CATEGORIES
-from ...base import tokenize, normalize_token
+from ...base import normalize_token, tokenize
+from ...bytes.core import get_fs_paths_myopen
 from ...compatibility import PY3
 from ...delayed import delayed
-from ...bytes.core import get_fs_paths_myopen
+from ..core import DataFrame, Series
+from ..utils import UNKNOWN_CATEGORIES
 
 try:
     import fastparquet
@@ -196,7 +197,7 @@ def _read_pyarrow(fs, paths, file_opener, columns=None, filters=None,
         index_col = None
     elif index is None and dataset.common_metadata:
         pandas_meta = dataset.common_metadata.metadata.get("pandas", {})
-        if isinstance(pandas_meta, basestring):
+        if isinstance(pandas_meta, six.string_types):
             import json
             pandas_meta = json.loads(pandas_meta)
         index_col = pandas_meta.get('index_columns')
