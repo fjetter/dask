@@ -192,16 +192,32 @@ def _read_pyarrow(fs, paths, file_opener, columns=None, filters=None,
 
     divisions = (None,) * (len(dataset.pieces) + 1)
 
-    dtypes = _get_pyarrow_dtypes(schema)
+    if index is False:
+        index_col = None
+    elif index is None and dataset.common_metadata:
+        pandas_meta = dataset.common_metadata.metadata.get("pandas", {})
+        if isinstance(pandas_meta, basestring):
+            import json
+            pandas_meta = json.loads(pandas_meta)
+        index_col = pandas_meta.get('index_columns')
+        all_columns += index_col
+    else:
+        index_col = index
+        all_columns.append(index)
 
+    dtypes = _get_pyarrow_dtypes(schema)
     meta = _meta_from_dtypes(all_columns, schema.names, dtypes)
+
+    if index_col:
+        meta = meta.set_index(index_col)
 
     task_plan = {
         (task_name, i): (_read_arrow_parquet_piece,
                          file_opener,
                          piece, all_columns,
                          out_type == Series,
-                         dataset.partitions)
+                         dataset.partitions,
+                         index_col)
         for i, piece in enumerate(dataset.pieces)
     }
 
@@ -219,11 +235,14 @@ def _get_pyarrow_dtypes(schema):
 
 
 def _read_arrow_parquet_piece(open_file_func, piece, columns, is_series,
-                              partitions):
+                              partitions, index_cols=None):
     with open_file_func(piece.path, mode='rb') as f:
         table = piece.read(columns=columns,  partitions=partitions,
                            file=f)
     df = table.to_pandas()
+
+    if index_cols:
+        df.set_index(index_cols, inplace=True)
 
     if is_series:
         return df[df.columns[0]]
@@ -291,7 +310,7 @@ def read_parquet(path, columns=None, filters=None, categories=None, index=None,
     elif engine == 'fastparquet':
         if not fastparquet:
             raise ImportError("fastparquet not installed")
-    elif engine == 'arrow':
+    elif engine == 'arrow' or engine == 'pyarrow':
         if not pyarrow_parquet:
             raise ImportError("pyarrow not installed")
     else:
