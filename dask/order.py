@@ -78,7 +78,13 @@ Work towards *small goals* with *big steps*.
 from collections import defaultdict
 from math import log
 
-from .core import get_dependencies, get_deps, getcycle, reverse_dict  # noqa: F401
+from .core import (  # noqa: F401
+    get_dependencies,
+    get_deps,
+    getcycle,
+    reverse_dict,
+    toposort,
+)
 from .utils_test import add, inc  # noqa: F401
 
 
@@ -712,3 +718,253 @@ class StrComparable:
             return self.obj < other.obj
         except Exception:
             return str(self.obj) < str(other.obj)
+
+
+def critical_path(dsk, weights=None, dependencies=None, dependents=None):
+    if not dsk:
+        return list(), {}
+    elif len(dsk) == 1:
+        path = list(dsk.keys())
+        return path, {path[0]: weights[path[0]]}
+
+    # if dependencies is None:
+    # dependencies, dependents = get_deps(dsk)
+    if weights is None:
+        weights = defaultdict(lambda: 1)
+    top_ordered = toposort(dsk, dependencies=dependencies)
+    path = []
+
+    cost = {k: weights[k] for k in dsk.keys()}
+    cost[top_ordered[0]] = weights[top_ordered[0]]
+    for v in top_ordered:
+
+        if v not in dsk:
+            continue
+        for u in dependents[v]:
+            if u not in dsk:
+                continue
+            w = weights[u]
+            if cost[v] + w > cost[u]:
+                cost[u] = cost[v] + w
+
+    max_key = top_ordered[-1]
+    max_cost = cost[max_key]
+    path = [max_key]
+
+    deps = True
+    while deps and len(path) != len(dsk):
+        deps = dependencies[max_key].intersection(set(dsk))
+
+        for d in deps:
+            if cost[d] + weights[max_key] == max_cost:
+                path.append(d)
+                max_cost = cost[d]
+                max_key = d
+                break
+
+    return path[::-1], cost
+
+
+def anc(dsk, dependencies, keys):
+    res = set()
+    for key in keys:
+        deps = dependencies[key]
+        res.update(deps)
+        res.update(anc(dsk, dependencies, deps))
+    return res
+
+
+def desc(dsk, dependents, keys):
+    res = set()
+    for key in keys:
+        deps = dependents[key]
+        res.update(deps)
+        res.update(desc(dsk, dependents, deps))
+    return res
+
+
+def curved_c(v, dsk, dependencies, dependents):
+    all_k = set(dsk.keys())
+    ancestors = anc(dsk, dependencies, {v})
+    descendents = desc(dsk, dependents, {v})
+    return all_k - ancestors - descendents - {v}
+
+
+def cpc(dsk, weights, dependencies, dependents):
+    lambda_star, _ = critical_path(dsk, weights, dependencies, dependents)
+    V_t = set(dsk) - set(lambda_star)
+    theta = list()
+    i = 0
+    theta.append(list())
+    for j, v_j in enumerate(lambda_star):
+        theta[i].append(v_j)
+        if j + 1 < len(lambda_star) and dependencies[lambda_star[j + 1]] != {v_j}:
+            i += 1
+            theta.append(list())
+    f = [set() for _ in range(len(theta))]
+
+    for i, _ in enumerate(theta):
+        if i + 1 < len(theta):
+            f[i] = anc(dsk, dependencies, theta[i + 1]).intersection(V_t)
+
+        # # TODO: I believe g is never used for the actual algorithm but only for
+        # # the analysis. If so, we can skip this and save some time.
+        # for k in f[i]:
+        #     c = curved_c(k, dsk, dependencies, dependents)
+        #     c_2 = c.intersection(V_t)
+        #     g[i].update(c_2)
+        # g[i] -= f[i]
+
+        V_t -= f[i]
+    g = {}
+    return theta, f, g
+
+
+def ensure_sink_source(dsk, dependencies, dependents, subset=None):
+    if not subset:
+        subset = set(dsk.keys())
+    dsk = {k: v for k, v in dsk.items() if k in subset}
+    sources = {
+        k
+        for k in dsk
+        if len(dependencies[k].intersection(subset)) == 0
+        and k not in ["dummy_source", "dummy_sink"]
+    }
+
+    sinks = {
+        k
+        for k in dsk
+        if len(dependents[k].intersection(subset)) == 0
+        and k not in ["dummy_source", "dummy_sink"]
+    }
+
+    if len(sources) > 1:
+        dummy_source = "dummy_source"
+        dsk[dummy_source] = None
+        dependencies[dummy_source] = set()
+        dependents[dummy_source] = set()
+        for s in sources:
+            dependencies[s] = {dummy_source}
+            dependents[dummy_source].add(s)
+    if len(sinks) > 1:
+        dummy_sink = "dummy_sink"
+        dsk[dummy_sink] = None
+        dependencies[dummy_sink] = set()
+        dependents[dummy_sink] = set()
+        for s in sinks:
+            dependents[s] = {dummy_sink}
+            dependencies[dummy_sink].add(s)
+        # dsk[dummy_sink] = tuple([lambda: None] +  list(sinks))
+    return dsk
+
+
+def ea(dsk, weights, dependencies, dependents, pj=None):
+    """
+    Implementation follows https://eprints.whiterose.ac.uk/167629/1/rtss2020_dag.pdf
+
+    TODO: check out https://arxiv.org/pdf/1904.07414.pdf
+    """
+    dsk = ensure_sink_source(dsk, dependencies, dependents)
+    weights = {k: v for k, v in weights.items() if k in dsk}
+    weights["dummy_source"] = 1
+    weights["dummy_sink"] = 1
+    # dependencies, dependents = get_deps(dsk)
+    if pj is None:
+        pj = defaultdict(lambda: 0)
+        p = 0
+    else:
+        p = min(pj.values()) - 1
+    theta, f, g = cpc(
+        dsk,
+        weights,
+        dependencies,
+        dependents,
+    )
+
+    for theta_j in theta:
+        for vj in theta_j:
+            pj[vj] = p
+    p -= 1
+
+    for i in range(len(theta)):
+        while f[i]:
+            subgraph = ensure_sink_source(
+                dsk, dependencies=dependencies, dependents=dependents, subset=f[i]
+            )
+
+            crit_i, costs = critical_path(
+                subgraph,
+                # {k: v for k, v in dsk.items() if k in f[i]},
+                weights,
+                dependencies,
+                dependents,
+            )
+
+            # ve = max(costs, key=lambda x: x[1])[0]
+            if any(dependencies.get(v, set()).intersection(f[i]) for v in crit_i):
+                # theta, _, _ = cpc({k: v for k, v in dsk.items() if k in f[i]}, weights, dependencies, dependents)
+                ea(
+                    subgraph,
+                    # {k: v for k, v in dsk.items() if k in f[i]},
+                    weights,
+                    dependencies=dependencies,
+                    dependents=dependents,
+                    pj=pj,
+                )
+                for k in f[i]:
+                    assert k in pj
+                break
+            else:
+                for k in crit_i:
+                    pj[k] = p
+                p -= 1
+                f[i] -= set(crit_i)
+    pj.pop("dummy_sink", None)
+    pj.pop("dummy_source", None)
+    return pj
+
+
+from heapq import heapify, heappop, heappush
+
+import copy
+
+
+def order(dsk, dependencies=None):
+    weights = {k: 1 for k in dsk}
+    if not dependencies:
+        dependencies, dependents = get_deps(dsk)
+    else:
+        dependents = reverse_dict(dependencies)
+    # FIXME the subgraph walk modified this inplace but we'll need it for later
+    # sorting
+    dep_orig = copy.deepcopy(dependencies)
+    weights = {k: len(v) for k, v in dependencies.items()}
+    pj = ea(dsk, weights=weights, dependencies=dependencies, dependents=dependents)
+
+    # TODO: Technically the following is not necessary but current prios after
+    # ordering are positive-definite
+    assert len(pj) == len(dsk)
+    dependencies = dep_orig
+    dependents = reverse_dict(dep_orig)
+    degree = {}
+    sources = []
+    for k, deps in dependencies.items():
+        degree[k] = len(deps)
+        if len(deps) == 0:
+            sources.append((-pj[k], StrComparable(k), k))
+
+    heapify(sources)
+    res = {}
+    counter = 0
+    while sources:
+        prio, _, k = heappop(sources)
+        res[k] = counter
+        counter += 1
+        for dep in dependents[k]:
+            if dep.startswith("dummy"):
+                continue
+            degree[dep] -= 1
+            if degree[dep] == 0:
+                heappush(sources, (-pj[dep], StrComparable(dep), dep))
+    assert len(res) == len(dsk)
+    return res
