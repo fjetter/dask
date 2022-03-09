@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import logging
 import math
@@ -21,6 +23,120 @@ from .core import DataFrame, Series, _Frame, map_partitions, new_dd_object
 from .dispatch import group_split_dispatch, hash_object_dispatch
 
 logger = logging.getLogger(__name__)
+
+_PAYLOAD_COL = "__dask_payload_bytes"
+
+
+def pack_payload_pandas(partition: pd.DataFrame, group_key: list[str]) -> pd.DataFrame:
+    try:
+        # Technically distributed is an optional dependency
+        from distributed.protocol import serialize_bytes
+    except ImportError:
+        return partition
+    assert group_key == "_partitions"
+    if partition.empty:
+        res = partition[group_key]
+        res[_PAYLOAD_COL] = b""
+        return res
+
+    res = partition.groupby(group_key, sort=False, observed=True, as_index=False).apply(
+        serialize_bytes
+    )
+
+    res.columns = group_key + [_PAYLOAD_COL]
+    return res
+
+
+def pack_payload(df: DataFrame, group_key: list[str] | str) -> DataFrame:
+    """
+    Pack all payload columns (everything except of group_key) into a single
+    columns. This column will contain a single byte string containing the
+    serialized and compressed payload data. The payload data is just dead weight
+    when reshuffling. By compressing it once before the shuffle starts, this
+    saves a lot of memory and network/disk IO.
+    Example::
+        >>> import pandas as pd
+        >>> import dask.dataframe as dd
+        >>> from dask.dataframe.shuffle import pack_payload
+        >>> df = pd.DataFrame({
+        ...    "A": [1, 1] * 2 + [2, 2] * 2 + [3, 3] * 2,
+        ...    "B": range(12)
+        ... })
+        >>> ddf = dd.from_pandas(df, npartitions=2)
+        >>> ddf.partitions[0].compute()
+           A  B
+        0  1  0
+        1  1  1
+        2  1  2
+        3  1  3
+        4  2  4
+        5  2  5
+        >>> pack_payload(ddf, "A").partitions[0].compute()
+           A                               __dask_payload_bytes
+        0  1  b'...
+        1  2  b'...
+    """
+
+    # if (
+    #     # TODO: Try to find out what's going on an file a bug report
+    #     # For datetime indices the apply seems to be corrupt
+    #     # s.t. apply(lambda x:x) returns different values
+    #     isinstance(df._meta.index, pd.DatetimeIndex)
+    # ):
+    #     return df
+
+    assert group_key == "_partitions", group_key
+    if not isinstance(group_key, list):
+        group_key = [group_key]
+
+    def _pack_payload(partition: pd.DataFrame) -> pd.DataFrame:
+        try:
+            # Technically distributed is an optional dependency
+            from distributed.protocol import serialize_bytes
+        except ImportError:
+            return partition
+
+        if partition.empty:
+            res = partition[group_key]
+            res[_PAYLOAD_COL] = b""
+        else:
+            res = partition.groupby(
+                group_key,
+                sort=False,
+                observed=True,
+                # Keep the as_index s.t. the group values are not dropped. With this
+                # the behaviour seems to be consistent along pandas versions
+                as_index=True,
+            ).apply(lambda x: pd.Series({_PAYLOAD_COL: serialize_bytes(x)}))
+
+            res = res.reset_index()
+        return res
+
+    return df.map_partitions(_pack_payload, meta=_pack_payload(df._meta))
+
+
+def unpack_payload(df: DataFrame, meta: DataFrame, reset_index: bool) -> DataFrame:
+    """Revert payload packing of ``pack_payload`` and restores full dataframe."""
+
+    def _unpack_payload(partition: pd.DataFrame) -> pd.DataFrame:
+        try:
+            # Technically distributed is an optional dependency
+            from distributed.protocol import deserialize_bytes
+        except ImportError:
+            return partition
+
+        if partition.empty:
+            return meta
+
+        mapped = partition[_PAYLOAD_COL].map(deserialize_bytes)
+        res = pd.concat(mapped.values)
+        if reset_index:
+            return res.reset_index(drop=True)
+        return res
+
+    if reset_index:
+        meta = meta.reset_index(drop=True)
+    return df.map_partitions(_unpack_payload, meta=meta)
 
 
 def _calculate_divisions(
@@ -486,17 +602,37 @@ def rearrange_by_column(
     if npartitions is not None and npartitions < df.npartitions:
         df = df.repartition(npartitions=npartitions)
 
+    df2 = df
+    calculated_partitions = False
+    if col != "_partitions":
+        calculated_partitions = True
+        partitions = df.map_partitions(
+            partitioning_index,
+            npartitions=npartitions or df.npartitions,
+            meta=df._meta._constructor_sliced([0]),
+            transform_divisions=False,
+        )
+        df = df.assign(_partitions=partitions)
+        col = "_partitions"
+    df2 = pack_payload(df, col)
     if shuffle == "disk":
-        return rearrange_by_column_disk(df, col, npartitions, compute=compute)
+        df3 = rearrange_by_column_disk(df2, col, npartitions, compute=compute)
+        df4 = unpack_payload(df3, df._meta, reset_index=False)
     elif shuffle == "tasks":
-        df2 = rearrange_by_column_tasks(
-            df, col, max_branch, npartitions, ignore_index=ignore_index
+        df3 = rearrange_by_column_tasks(
+            df2, col, max_branch, npartitions, ignore_index=ignore_index
         )
         if ignore_index:
-            df2._meta = df2._meta.reset_index(drop=True)
-        return df2
+            df4 = unpack_payload(df3, df._meta, reset_index=True)
+            df4._meta = df4._meta.reset_index(drop=True)
+        else:
+            df4 = unpack_payload(df3, df._meta, reset_index=False)
     else:
         raise NotImplementedError("Unknown shuffle method %s" % shuffle)
+    if calculated_partitions:
+        return df4.drop(columns=["_partitions"])
+    else:
+        return df4
 
 
 class maybe_buffered_partd:
