@@ -604,7 +604,8 @@ def rearrange_by_column(
 
     df2 = df
     calculated_partitions = False
-    if col != "_partitions":
+    compression = config.get("dataframe.shuffle-compression", None)
+    if compression and col != "_partitions":
         calculated_partitions = True
         partitions = df.map_partitions(
             partitioning_index,
@@ -614,22 +615,24 @@ def rearrange_by_column(
         )
         df = df.assign(_partitions=partitions)
         col = "_partitions"
-    df2 = pack_payload(df, col)
+
+    df2 = pack_payload(df, col) if compression else df
     if shuffle == "disk":
         df3 = rearrange_by_column_disk(df2, col, npartitions, compute=compute)
-        df4 = unpack_payload(df3, df._meta, reset_index=False)
     elif shuffle == "tasks":
         df3 = rearrange_by_column_tasks(
             df2, col, max_branch, npartitions, ignore_index=ignore_index
         )
-        if ignore_index:
-            df4 = unpack_payload(df3, df._meta, reset_index=True)
-            df4._meta = df4._meta.reset_index(drop=True)
-        else:
-            df4 = unpack_payload(df3, df._meta, reset_index=False)
     else:
         raise NotImplementedError("Unknown shuffle method %s" % shuffle)
-    if calculated_partitions:
+
+    if compression:
+        df4 = unpack_payload(df3, df._meta, reset_index=ignore_index)
+    else:
+        df4 = df3
+    if ignore_index:
+        df4._meta = df4._meta.reset_index(drop=True)
+    if calculated_partitions and compression:
         return df4.drop(columns=["_partitions"])
     else:
         return df4

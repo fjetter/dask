@@ -49,6 +49,14 @@ if dd._compat.PANDAS_GT_110:
 shuffle_func = shuffle  # conflicts with keyword argument
 
 
+# FIXME: The picked algorithm is not used for the tasks compression. The tasks
+# compression uses distributed.comm.compression instead.
+@pytest.fixture(params=["lz4", False], autouse=True)
+def toggle_shuffle(request):
+    with dask.config.set({"dataframe.shuffle-compression": request.param}):
+        yield
+
+
 def test_shuffle(shuffle_method):
     s = shuffle_func(d, d.b, shuffle=shuffle_method)
     assert isinstance(s, dd.DataFrame)
