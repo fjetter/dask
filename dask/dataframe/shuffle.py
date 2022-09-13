@@ -717,7 +717,7 @@ def rearrange_by_column_tasks(
     n = df.npartitions
     stages = int(math.ceil(math.log(n) / math.log(max_branch)))
     if stages > 1:
-        k = int(math.ceil(n ** (1 / stages)))
+        k = int(math.floor(n ** (1 / stages)))
     else:
         k = n
 
