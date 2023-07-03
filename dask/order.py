@@ -81,7 +81,95 @@ from collections import defaultdict, namedtuple
 from math import log
 
 from dask.core import get_dependencies, get_deps, getcycle, reverse_dict
+from heapq import heapify, heappop, heappush
 
+
+def toposort_kahn(dsk, dependencies=None):
+    from dask.base import visualize
+    visualize(dsk)
+    print("new algorithm")
+    ordered = {}
+    priority = 0
+    if dependencies is None:
+        dependencies = {k: get_dependencies(dsk, k) for k in dsk}
+
+    dependents = reverse_dict(dependencies)
+    num_needed, total_dependencies = ndependencies(dependencies, dependents)
+    metrics = graph_metrics(dependencies, dependents, total_dependencies)
+
+    crit_path = critical_path(dsk, dependencies=dependencies, dependents=dependents, metrics=metrics)
+    # For disconnected graphs, this won't work.
+    if len(crit_path) != len(dsk):
+        crit_path = defaultdict(int)
+
+    def dependencies_key(x):
+        """Choose which dependency to run as part of a reverse DFS
+
+        This is very similar to both ``initial_stack_key``.
+        """
+        num_dependents = len(dependents[x])
+        (
+            total_dependents,
+            min_dependencies,
+            max_dependencies,
+            min_heights,
+            max_heights,
+        ) = metrics[x]
+        # Prefer short and narrow instead of tall in narrow, because we're going in
+        # reverse along dependencies.
+        return (
+            # -num_dependents,
+
+            # (num_dependents - len(dependencies[x])),
+            # at a high-level, work towards a large goal (and prefer short and narrow)
+            # tactically, finish small connected jobs first
+            min_dependencies,
+            max_dependencies,
+            # negative This is required to go broad in test_many_branches_use_ndependencies
+            - abs(len(dependencies[x]) - num_dependents) / (num_dependents + len(dependencies[x])),
+            # num_dependents - len(dependencies[x]) , # This is import to force reductions
+            # -(num_dependents + min_heights),  # prefer short and narrow
+            # (num_dependents + max_heights),
+            -54321,
+            num_dependents / total_dependents,
+            num_dependents / (len(dependencies[x]) + num_dependents),
+            -1235,
+            crit_path[x],
+            -total_dependencies[x],  # go where the work is
+            # try to be memory efficient
+            crit_path[x],
+            -total_dependents,  # already found work, so don't add more
+            # tie-breaker
+            StrComparable(x),
+        )
+
+    runnable = []
+    degrees = {}
+    for k, deps in dependencies.items():
+        degrees[k] = deg = len(deps)
+        if not deg:
+            runnable.append((dependencies_key(k), k))
+    heapify(runnable)
+
+    def _pick(k):
+        nonlocal priority
+        ordered[k] = priority
+        priority += 1
+        deps = dependents[k]
+        for d in deps:
+            degrees[d] -= 1
+            if degrees[d] == 0:
+                # If there is a linear chain, let's short circuit
+                if len(dependencies[d]) == 1 and len(dependents[k]) == 1:
+                    _pick(d)
+                    continue
+                heappush(runnable, (dependencies_key(d), d))
+
+    while runnable:
+        _, k = heappop(runnable)
+        _pick(k)
+
+    return ordered
 
 def order(dsk, dependencies=None):
     """Order nodes in dask graph
@@ -108,9 +196,10 @@ def order(dsk, dependencies=None):
     >>> order(dsk)
     {'a': 0, 'c': 1, 'b': 2, 'd': 3}
     """
+    return toposort_kahn(dsk, dependencies=dependencies)
     if not dsk:
         return {}
-
+    print("default algorithm")
     if dependencies is None:
         dependencies = {k: get_dependencies(dsk, k) for k in dsk}
 
@@ -803,6 +892,95 @@ def order(dsk, dependencies=None):
         inner_stack.append(item)
 
     return result
+def dependencies_key(x, dependents, metrics, dependencies, num_needed, total_dependencies):
+    """Choose which dependency to run as part of a reverse DFS
+
+    This is very similar to both ``initial_stack_key``.
+    """
+    num_dependents = len(dependents[x])
+    (
+        total_dependents,
+        min_dependencies,
+        max_dependencies,
+        min_heights,
+        max_heights,
+    ) = metrics[x]
+    # Prefer short and narrow instead of tall in narrow, because we're going in
+    # reverse along dependencies.
+    return (
+        # at a high-level, work towards a large goal (and prefer short and narrow)
+        -max_dependencies,
+        num_dependents + max_heights,
+        # tactically, finish small connected jobs first
+        min_dependencies,
+        num_dependents + min_heights,  # prefer short and narrow
+        -total_dependencies[x],  # go where the work is
+        # try to be memory efficient
+        num_dependents - len(dependencies[x]) + num_needed[x],
+        num_dependents,
+        total_dependents,  # already found work, so don't add more
+        # tie-breaker
+        StrComparable(x),
+    )
+
+def critical_path(dsk, dependencies, dependents, metrics):
+    """This is using a variant of Dijkstra's to calculate distance from the root
+    node. We're not actually looking for a shortest path to the target, rather
+    the distance to that root node."""
+    roots = set()
+    for k in dsk:
+        if len(dependencies[k]) == 0:
+            roots.add(k)
+    # TODO: Use calc_measure from above. This way, the picked root here is the
+    # same as for the ordering
+    def order_by(x):
+        num_dependents = len(dependents[x])
+        (
+            total_dependents,
+            min_dependencies,
+            max_dependencies,
+            min_heights,
+            max_heights,
+        ) = metrics[x]
+
+        return (
+            -max_dependencies,
+            num_dependents + min_heights,  # prefer short and narrow
+            # at a high-level, work towards a large goal (and prefer short and narrow)
+            num_dependents + max_heights,
+            -total_dependents,  # already found work, so don't add more
+            # tactically, finish small connected jobs first
+            min_dependencies,
+            # -total_dependencies[x],  # go where the work is
+            # # try to be memory efficient
+            # num_dependents - len(dependencies[x]) + num_needed[x],
+            num_dependents,
+            # tie-breaker
+            StrComparable(x),
+        )
+    current = min(
+        roots,
+        key=order_by,
+    )
+    distance = {current: 0}
+    prio_q = [(0, current)]
+    in_q = {current}
+    while prio_q:
+        _, current = heappop(prio_q)
+        in_q.remove(current)
+        neighbours = set()
+        neighbours.update(dependencies[current])
+        neighbours.update(dependents[current])
+        for d in neighbours:
+            weight = 1
+            alt = distance.get(current, len(dsk)) + weight
+            if alt < distance.get(d, len(dsk)):
+                distance[d] = alt
+                if d not in in_q:
+                    heappush(prio_q, (alt, d))
+                    in_q.add(d)
+
+    return distance
 
 
 def graph_metrics(dependencies, dependents, total_dependencies):
