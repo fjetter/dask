@@ -80,3 +80,43 @@ def diagnostics(dsk, o=None, dependencies=None):
         for key, val in o.items()
     }
     return rv, pressure
+
+
+def ndependencies(dependencies, dependents):
+    """Number of total data elements on which this key depends
+
+    For each key we return the number of tasks that must be run for us to run
+    this task.
+
+    Examples
+    --------
+    >>> dsk = {'a': 1, 'b': (inc, 'a'), 'c': (inc, 'b')}
+    >>> dependencies, dependents = get_deps(dsk)
+    >>> num_dependencies, total_dependencies = ndependencies(dependencies, dependents)
+    >>> sorted(total_dependencies.items())
+    [('a', 1), ('b', 2), ('c', 3)]
+
+    Returns
+    -------
+    num_dependencies: Dict[key, int]
+    total_dependencies: Dict[key, int]
+    """
+    num_needed = {k: len(v) for k, v in dependencies.items()}
+    num_dependencies = num_needed.copy()
+    current = []
+    current_pop = current.pop
+    current_append = current.append
+    result = {k: 1 for k, v in dependencies.items() if not v}
+    for key in result:
+        for parent in dependents[key]:
+            num_needed[parent] -= 1
+            if not num_needed[parent]:
+                current_append(parent)
+    while current:
+        key = current_pop()
+        result[key] = 1 + sum(result[child] for child in dependencies[key])
+        for parent in dependents[key]:
+            num_needed[parent] -= 1
+            if not num_needed[parent]:
+                current_append(parent)
+    return num_dependencies, result
