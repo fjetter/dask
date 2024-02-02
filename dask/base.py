@@ -1024,7 +1024,12 @@ def _md5(x: ReadableBuffer, _hashlib_md5: _HashFactory = hashlib.md5) -> hashlib
     return _hashlib_md5(x, usedforsecurity=False)
 
 
-def tokenize(*args, **kwargs):
+_DETERMINISTIC_TOKEN: ContextVar[bool] = ContextVar("_DETERMINISTIC_TOKEN")
+
+
+def tokenize(
+    *args: Any, ensure_deterministic: bool | None = None, **kwargs: Any
+) -> str:
     """Deterministic token
 
     >>> tokenize([1, 2, '3'])
@@ -1033,10 +1038,19 @@ def tokenize(*args, **kwargs):
     >>> tokenize('Hello') == tokenize('Hello')
     True
     """
-    hasher = _md5(str(tuple(map(normalize_token, args))).encode())
-    if kwargs:
-        hasher.update(str(normalize_token(kwargs)).encode())
-    return hasher.hexdigest()
+    if ensure_deterministic is not None:
+        token = _DETERMINISTIC_TOKEN.set(ensure_deterministic)
+    else:
+        token = _DETERMINISTIC_TOKEN.set(
+            bool(config.get("tokenize.ensure-deterministic", False))
+        )
+    try:
+        hasher = _md5(str(tuple(map(normalize_token, args))).encode())
+        if kwargs:
+            hasher.update(str(normalize_token(kwargs)).encode())
+        return hasher.hexdigest()
+    finally:
+        _DETERMINISTIC_TOKEN.reset(token)
 
 
 normalize_token = Dispatch()
@@ -1083,7 +1097,7 @@ def _normalize_seq_func(seq):
     try:
         return list(map(normalize_token, seq))
     except RecursionError:
-        if not config.get("tokenize.ensure-deterministic"):
+        if not _DETERMINISTIC_TOKEN.get():
             return uuid.uuid4().hex
 
         raise RuntimeError(
@@ -1138,7 +1152,7 @@ def normalize_object(o):
     if dataclasses.is_dataclass(o):
         return normalize_dataclass(o)
 
-    if not config.get("tokenize.ensure-deterministic"):
+    if not _DETERMINISTIC_TOKEN.get():
         return uuid.uuid4().hex
 
     raise RuntimeError(
@@ -1189,7 +1203,7 @@ def _normalize_function(func: Callable) -> tuple | str | bytes:
                 return result
         except Exception:
             pass
-        if not config.get("tokenize.ensure-deterministic"):
+        if not _DETERMINISTIC_TOKEN.get():
             try:
                 import cloudpickle
 
@@ -1342,7 +1356,7 @@ def register_numpy():
                     data = hash_buffer_hex(pickle.dumps(x, pickle.HIGHEST_PROTOCOL))
                 except Exception:
                     # pickling not supported, use UUID4-based fallback
-                    if not config.get("tokenize.ensure-deterministic"):
+                    if not _DETERMINISTIC_TOKEN.get():
                         data = uuid.uuid4().hex
                     else:
                         raise RuntimeError(
