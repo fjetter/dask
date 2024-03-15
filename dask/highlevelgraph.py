@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import copy
 import html
+from collections import defaultdict
 from collections.abc import (
     Collection,
     Hashable,
@@ -23,7 +24,7 @@ import dask
 from dask import config
 from dask.base import clone_key, flatten, is_dask_collection, normalize_token
 from dask.core import keys_in_tasks, reverse_dict
-from dask.typing import DaskCollection, Graph, Key
+from dask.typing import Graph, Key, LegacyDaskCollection
 from dask.utils import ensure_dict, import_required, key_split
 from dask.widgets import get_template
 
@@ -448,7 +449,7 @@ class HighLevelGraph(Graph):
         cls,
         name: str,
         layer: Graph,
-        dependencies: Sequence[DaskCollection] = (),
+        dependencies: Sequence[LegacyDaskCollection] = (),
     ) -> HighLevelGraph:
         """Construct a HighLevelGraph from a new layer and a set of collections
 
@@ -771,6 +772,17 @@ class HighLevelGraph(Graph):
         }
 
         return HighLevelGraph(ret_layers, ret_dependencies, ret_key_deps)
+
+    def __dask_annotations__(self) -> dict:
+        annotations_by_type: defaultdict[str, dict[Key, Any]] = defaultdict(dict)
+        for layer in self.layers.values():
+            if layer.annotations:
+                annot = layer.annotations
+                for annot_type, value in annot.items():
+                    annotations_by_type[annot_type].update(
+                        {k: (value(k) if callable(value) else value) for k in layer}
+                    )
+        return dict(annotations_by_type)
 
     def cull_layers(self, layers: Iterable[str]) -> HighLevelGraph:
         """Return a new HighLevelGraph with only the given layers and their

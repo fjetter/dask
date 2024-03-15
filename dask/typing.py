@@ -103,7 +103,7 @@ class PostPersistCallable(Protocol[CollType_co]):
 
 
 @runtime_checkable
-class DaskCollection(Protocol):
+class DaskCollectionBase(Protocol):
     """Protocol defining the interface of a Dask collection."""
 
     @abc.abstractmethod
@@ -156,31 +156,6 @@ class DaskCollection(Protocol):
             of the graph. After computation, the results will be
             returned in the same layout, with the keys replaced with
             their corresponding outputs.
-
-        """
-        raise NotImplementedError("Inheriting class must implement this method.")
-
-    @abc.abstractmethod
-    def __dask_postcompute__(self) -> tuple[PostComputeCallable, tuple]:
-        """Finalizer function and optional arguments to construct final result.
-
-        Upon computation each key in the collection will have an in
-        memory result, the postcompute function combines each key's
-        result into a final in memory representation. For example,
-        dask.array.Array concatenates the arrays at each chunk into a
-        final in-memory array.
-
-        Returns
-        -------
-        PostComputeCallable
-            Callable that receives the sequence of the results of each
-            final key along with optional arguments. An example signature
-            would be ``finalize(results: Sequence[Any], *args)``.
-        tuple[Any, ...]
-            Optional arguments passed to the function following the
-            key results (the `*args` part of the
-            ``PostComputeCallable``. If no additional arguments are to
-            be passed then this must be an empty tuple.
 
         """
         raise NotImplementedError("Inheriting class must implement this method.")
@@ -397,6 +372,148 @@ class DaskCollection(Protocol):
 
         """
         raise NotImplementedError("Inheriting class must implement this method.")
+
+
+@runtime_checkable
+class LegacyDaskCollection(DaskCollectionBase, Protocol):
+    @abc.abstractmethod
+    def __dask_postcompute__(self) -> tuple[PostComputeCallable, tuple]:
+        """Finalizer function and optional arguments to construct final result.
+
+        Upon computation each key in the collection will have an in
+        memory result, the postcompute function combines each key's
+        result into a final in memory representation. For example,
+        dask.array.Array concatenates the arrays at each chunk into a
+        final in-memory array.
+
+        Returns
+        -------
+        PostComputeCallable
+            Callable that receives the sequence of the results of each
+            final key along with optional arguments. An example signature
+            would be ``finalize(results: Sequence[Any], *args)``.
+        tuple[Any, ...]
+            Optional arguments passed to the function following the
+            key results (the `*args` part of the
+            ``PostComputeCallable``. If no additional arguments are to
+            be passed then this must be an empty tuple.
+
+        """
+        raise NotImplementedError("Inheriting class must implement this method.")
+
+
+@runtime_checkable
+class DaskCollection(DaskCollectionBase, Protocol):
+    @abc.abstractmethod
+    def __dask_graph_factory__(self):
+        raise NotImplementedError("Inheriting class must implement this method.")
+
+    @abc.abstractmethod
+    def __dask_precompute__(self):
+        raise AttributeError("Inheriting class must implement this method.")
+
+
+@runtime_checkable
+class GraphFactory(Protocol):
+    """Protocol defining the signature of a graph factory."""
+
+    @abc.abstractmethod
+    def __dask_annotations__(self) -> dict:
+        ...
+
+    @abc.abstractmethod
+    def __dask_keys__(self) -> list[Key]:
+        ...
+
+    @abc.abstractmethod
+    def __dask_tokenize__(self) -> str:
+        ...
+
+    @abc.abstractmethod
+    def optimize(self, *args, **kwargs) -> GraphFactory:
+        ...
+
+
+# TODO: A little too much logic for typing.py below
+class LiteralGraphFactory(GraphFactory):
+    """Protocol defining the signature of a graph factory."""
+
+    def __init__(self, dsk, keys=None):
+        self._dsk = dsk
+        self._keys = keys or list(dsk)
+
+    def __dask_annotations__(self) -> dict:
+        return {}
+
+    def __dask_keys__(self) -> list[Key]:
+        return list(self._keys)
+
+    def __dask_tokenize__(self) -> str:
+        from dask.base import tokenize
+
+        return tokenize(self._dsk, self._keys)
+
+    def optimize(self, *args, **kwargs) -> LiteralGraphFactory:
+        return self
+
+
+class HLGGraphFactory(GraphFactory):
+    _parameters = [
+        "hlg",
+        "keys",
+        "name_prefix",
+    ]
+
+    def __init__(self, hlg, keys, name_prefix="from_hlg"):
+        self._hlg = hlg
+        self._keys = keys
+        self._name_prefix = name_prefix
+
+    def __dask_tokenize__(self) -> str:
+        from dask.base import tokenize
+
+        return tokenize(self._hlg, self._keys, self._name_prefix)
+
+    @property
+    def _name(self):
+        from dask.base import tokenize
+
+        return self._name_prefix + "-" + tokenize(self)
+
+    def __dask_graph__(self):
+        from dask.utils import ensure_dict
+
+        dsk = ensure_dict(self._hlg, copy=True)
+        # The name may not actually match the layers name therefore rewrite this
+        # using an alias
+        for part, k in enumerate(self._keys):
+            dsk[(self._name, part)] = k
+        return dsk
+
+    def __dask_annotations__(self) -> dict:
+        return self._hlg.__dask_annotations__()
+
+    def __dask_keys__(self):
+        return list(self._keys)
+
+    def optimize(self, *args, **kwargs):
+        return self
+
+
+# TODO: This is only used once in client.get. This is suspicious.
+def ensure_graph_factory(obj, keys):
+    from dask.highlevelgraph import HighLevelGraph
+
+    if isinstance(obj, GraphFactory):
+        return obj
+    elif isinstance(obj, HighLevelGraph):
+        return HLGGraphFactory(obj, keys)
+    elif isinstance(obj, Mapping):
+        return LiteralGraphFactory(obj, keys)
+    else:
+        raise TypeError(
+            f"Object {obj} of type {type(obj)} is not a valid graph factory"
+        )
 
 
 @runtime_checkable

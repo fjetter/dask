@@ -422,7 +422,11 @@ def get_async(
         result_flat = {result}
     results = set(result_flat)
 
-    dsk = dict(dsk)
+    # TODO: Check if this try/except block is still needed and if so, why
+    try:
+        dsk = dict(dsk.__dask_graph__())
+    except AttributeError:
+        dsk = dict(dsk)
     with local_callbacks(callbacks) as callbacks:
         _, _, pretask_cbs, posttask_cbs, _ = unpack_callbacks(callbacks)
         started_cbs = []

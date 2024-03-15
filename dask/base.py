@@ -21,6 +21,7 @@ from operator import getitem
 from typing import Any, Literal, TypeVar
 
 import cloudpickle
+import toolz
 from tlz import curry, groupby, identity, merge
 from tlz.functoolz import Compose
 
@@ -31,7 +32,14 @@ from dask.core import get as simple_get
 from dask.core import literal, quote
 from dask.hashing import hash_buffer_hex
 from dask.system import CPU_COUNT
-from dask.typing import Key, SchedulerGetCallable
+from dask.typing import (
+    DaskCollection,
+    Graph,
+    GraphFactory,
+    Key,
+    LegacyDaskCollection,
+    SchedulerGetCallable,
+)
 from dask.utils import (
     Dispatch,
     apply,
@@ -227,26 +235,15 @@ def is_dask_collection(x) -> bool:
     implementation of the protocol.
 
     """
-    if (
-        isinstance(x, type)
-        or not hasattr(x, "__dask_graph__")
-        or not callable(x.__dask_graph__)
-    ):
-        return False
-
-    pkg_name = getattr(type(x), "__module__", "").split(".")[0]
-    if pkg_name in ("dask_expr", "dask_cudf"):
-        # Temporary hack to avoid graph materialization. Note that this won't work with
-        # dask_expr.array objects wrapped by xarray or pint. By the time dask_expr.array
-        # is published, we hope to be able to rewrite this method completely.
-        # Read: https://github.com/dask/dask/pull/10676
+    if isinstance(x, DaskCollection):
         return True
-
-    # xarray, pint, and possibly other wrappers always define a __dask_graph__ method,
-    # but it may return None if they wrap around a non-dask object.
-    # In all known dask collections other than dask-expr,
-    # calling __dask_graph__ is cheap.
-    return x.__dask_graph__() is not None
+    elif isinstance(x, LegacyDaskCollection):
+        # xarray, pint, and possibly other wrappers always define a __dask_graph__ method,
+        # but it may return None if they wrap around a non-dask object.
+        # In all known dask collections other than dask-expr,
+        # calling __dask_graph__ is cheap.
+        return x.__dask_graph__() is not None
+    return False
 
 
 class DaskMethodsMixin:
@@ -408,6 +405,112 @@ def dont_optimize(dsk, keys, **kwargs):
 
 def optimization_function(x):
     return getattr(x, "__dask_optimize__", dont_optimize)
+
+
+class LegacyMultiGraphFactory(GraphFactory):
+    def __init__(self, *args) -> None:
+        self.operands = args
+
+    def __dask_tokenize__(self) -> str:
+        return tokenize(self.operands)
+
+    def __dask_keys__(self) -> list:
+        from dask.core import flatten
+
+        return list(flatten([inner.__dask_keys__() for inner in self.operands]))
+
+    def __str__(self):
+        return f"LegacyMultiGraphFactory({', '.join(map(str, self.operands))})"
+
+    def optimize(self, **kwargs):
+        return self
+
+    def __dask_annotations__(self) -> dict:
+        return toolz.dicttoolz.merge(
+            [op.__dask_annotations__() for op in self.operands]
+        )
+
+    def __dask_graph__(self):
+        """Traverse expression tree, collect layers"""
+        return toolz.merge([expr.__dask_graph__() for expr in self.operands])
+
+
+def collections_to_graphfactory(
+    collections: (
+        LegacyDaskCollection
+        | DaskCollection
+        | Iterable[LegacyDaskCollection | DaskCollection]
+    ),
+    *,
+    precompute: bool,
+    optimize_graph: bool,
+) -> GraphFactory:
+    if not isinstance(collections, (tuple, list, set, frozenset)):
+        collections = [c for c in collections]  # type: ignore
+
+    from dask.typing import HLGGraphFactory
+
+    try:
+        from dask_expr._core import Tuple as CombinedFactory
+    except ImportError:
+        CombinedFactory = LegacyMultiGraphFactory
+
+    from dask.highlevelgraph import HighLevelGraph
+
+    try:
+        from dask.delayed import single_key
+    except ImportError:
+        from tlz import first
+
+        single_key = first
+
+    expressions = []
+    hlg_collections = []
+    for c in collections:
+        if isinstance(c, LegacyDaskCollection):
+            if c.__dask_graph__() is not None:
+                hlg_collections.append(c)
+        elif isinstance(c, DaskCollection):
+            if precompute:
+                c = c.__dask_precompute__()
+            expressions.append(c.__dask_graph_factory__())
+
+    if hlg_collections:
+        dsk = collections_to_dsk(hlg_collections, optimize_graph=optimize_graph)
+        if not isinstance(dsk, HighLevelGraph):
+            # This case is really bad since we already triggered materialization
+            dsk = HighLevelGraph.from_collections(str(id(dsk)), dsk, dependencies=())
+
+        if precompute:
+            names = ["finalize-%s" % tokenize(v) for v in hlg_collections]
+            dsk2 = {}
+            for i, (name, v) in enumerate(zip(names, hlg_collections)):
+                func, extra_args = v.__dask_postcompute__()
+                keys = v.__dask_keys__()
+                if func is single_key and len(keys) == 1 and not extra_args:
+                    names[i] = keys[0]  # type: ignore[assignment]
+                else:
+                    dsk2[name] = (func, keys) + extra_args
+            # Let's append the finalize graph to dsk
+            finalize_name = tokenize(names)
+            layers: dict[Any, Graph]
+            layers = {finalize_name: dsk2}  # type: ignore[dict-item]
+            del dsk2
+            layers.update(dsk.layers)
+            dependencies = {finalize_name: set(dsk.layers.keys())}
+            dependencies.update(dsk.dependencies)
+            dsk = HighLevelGraph(layers, dependencies)
+        else:
+            names = [k for c in hlg_collections for k in flatten(c.__dask_keys__())]
+            # TODO: Not really sure where this name pops up
+            finalize_name = f"finalize-{tokenize(dsk.layers.keys())}"
+        expressions.append(HLGGraphFactory(dsk, names, "finalize"))
+
+    if len(collections) > 1:
+        out = CombinedFactory(*expressions)
+    else:
+        out = expressions[0]
+    return out
 
 
 def collections_to_dsk(collections, optimize_graph=True, optimizations=(), **kwargs):
@@ -650,17 +753,15 @@ def compute(
         collections=collections,
         get=get,
     )
-
-    dsk = collections_to_dsk(collections, optimize_graph, **kwargs)
-    keys, postcomputes = [], []
-    for x in collections:
-        keys.append(x.__dask_keys__())
-        postcomputes.append(x.__dask_postcompute__())
-
+    dsk = collections_to_graphfactory(
+        collections, precompute=True, optimize_graph=optimize_graph
+    )
+    dsk = dsk.optimize()
+    keys = dsk.__dask_keys__()
     with shorten_traceback():
         results = schedule(dsk, keys, **kwargs)
 
-    return repack([f(r, *a) for r, (f, a) in zip(results, postcomputes)])
+    return repack(results)
 
 
 def visualize(

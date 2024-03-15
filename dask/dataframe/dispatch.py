@@ -9,6 +9,7 @@ from __future__ import annotations
 import pandas as pd
 
 from dask import is_dask_collection
+from dask.typing import GraphFactory
 from dask.utils import Dispatch
 
 make_meta_dispatch = Dispatch("make_meta_dispatch")
@@ -119,7 +120,7 @@ def make_meta(x, index=None, parent_meta=None):
     """
 
     if not isinstance(x, (pd.Series, pd.DataFrame, pd.Index)) and hasattr(x, "_meta"):
-        if is_dask_collection(x):
+        if is_dask_collection(x) or isinstance(x, GraphFactory):
             return x._meta
 
     try:
