@@ -1016,7 +1016,7 @@ def test_make_blockwise_sorted_slice():
     np.testing.assert_array_equal(b, index3)
 
 
-@pytest.mark.filterwarnings("ignore:Slicing:dask.array.core.PerformanceWarning")
+# @pytest.mark.filterwarnings("ignore:Slicing:dask.array.core.PerformanceWarning")
 @pytest.mark.parametrize(
     "size, chunks", [((100, 2), (50, 2)), ((100, 2), (37, 1)), ((100,), (55,))]
 )

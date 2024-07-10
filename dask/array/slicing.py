@@ -589,48 +589,85 @@ def slicing_plan(chunks, index):
     return out
 
 
-def take(outname, inname, chunks, index, itemsize, axis=0):
-    """Index array with an iterable of index
+def split_or_merge_plan(chunks, plan, minsize, maxsize, itemsize):
+    """Take a trivial slicing plan as provided by slicing_plan and split or merge individual slices.
 
-    Handles a single index by a single list
+    If a slice is below `minsize` we're attempting to merge with a neighboring
+    slice. If a slice is above `maxsize` we're going to split it.
 
-    Mimics ``np.take``
+    A split slice may be considered for merging again if the prior
 
-    >>> from pprint import pprint
-    >>> chunks, dsk = take('y', 'x', [(20, 20, 20, 20)], [5, 1, 47, 3], 8, axis=0)
-    >>> chunks
-    ((2, 1, 1),)
-    >>> pprint(dsk)   # doctest: +ELLIPSIS
-    {('y', 0): (<function getitem at ...>, ('x', 0), (array([5, 1]),)),
-     ('y', 1): (<function getitem at ...>, ('x', 2), (array([7]),)),
-     ('y', 2): (<function getitem at ...>, ('x', 0), (array([3]),))}
+    Parameters
+    ----------
+    plan : _type_
+        _description_
+    minsize : _type_
+        _description_
+    maxsize : _type_
+        _description_
 
-    When list is sorted we retain original block structure
-
-    >>> chunks, dsk = take('y', 'x', [(20, 20, 20, 20)], [1, 3, 5, 47], 8, axis=0)
-    >>> chunks
-    ((3, 1),)
-    >>> pprint(dsk)     # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
-    {('y', 0): (<function getitem at ...>,
-                ('x', 0),
-                (array([1, 3, 5]),)),
-     ('y', 1): (<function getitem at ...>, ('x', 2), (array([7]),))}
-
-    When any indexed blocks would otherwise grow larger than
-    dask.config.array.chunk-size, we might split them,
-    depending on the value of ``dask.config.slicing.split-large-chunks``.
-
-    >>> import dask
-    >>> with dask.config.set({"array.slicing.split-large-chunks": True}):
-    ...      chunks, dsk = take('y', 'x', [(1, 1, 1), (2000, 2000), (2000, 2000)],
-    ...                        [0] + [1] * 6 + [2], axis=0, itemsize=8)
-    >>> chunks
-    ((1, 3, 3, 1), (2000, 2000), (2000, 2000))
     """
+    new_plan = []
+    ix = 0
+    size_of_slice = 0
+    size_of_inputs = 0
+    new_plan = []
+    new_slice = []
+    new_plan.append(new_slice)
+    while ix < len(plan):
+        origin, indices = plan[ix]
+        size_this_slice = len(indices) * itemsize
+        size_this_input = chunks[origin] * itemsize
+        if size_this_slice > maxsize:
+            index_sublist = np.array_split(
+                indices, math.ceil(size_this_slice / maxsize)
+            )
+            # If the subindices are mergable with the prior slice we can
+            # consider this here. This should only be relevant if the prior
+            # slice was/is tiny in a very inhomogeneous array.
+            plan.pop(ix)
+            for subind in reversed(index_sublist):
+                plan.insert(ix, (origin, subind))
+        elif not new_slice or (
+            # If the current slice falls below the minsize AND The input chunks
+            # are small enough to not breach maxsize (since they have to sit on
+            # the same worker together) we may proceed with merging the slices.
+            size_of_slice + size_this_slice < minsize
+            and size_of_inputs + size_this_input < maxsize
+        ):
+            new_slice.append(plan[ix])
+            size_of_slice += size_this_slice
+            size_of_inputs += size_this_input
+            ix += 1
+        else:
+            size_of_slice = 0
+            size_of_inputs = 0
+            new_slice = []
+            new_plan.append(new_slice)
+
+    return new_plan
+
+
+def take(outname, inname, chunks, index, itemsize, axis=0):
     from dask.array.core import PerformanceWarning
 
     plan = slicing_plan(chunks[axis], index)
+    # Check for chunks from the plan that would violate the user's
+    # configured chunk size.
+
+    # TODO: This nbytes should probably also consider chunk size of the input
+    # array. something like max(nbytes, input_chunk_size) could work well.
+    nbytes = utils.parse_bytes(config.get("array.chunk-size"))
+    plan = split_or_merge_plan(
+        chunks[axis],
+        plan,
+        minsize=nbytes * 0.5,
+        maxsize=nbytes * 2,
+        itemsize=itemsize,
+    )
     if len(plan) >= len(chunks[axis]) * 10:
+        # This warning is hard/impossible to trigger now that we're merging
+        # slices. It could still be happening if the input chunks are huge
         factor = math.ceil(len(plan) / len(chunks[axis]))
 
         warnings.warn(
@@ -639,73 +676,83 @@ def take(outname, inname, chunks, index, itemsize, axis=0):
             PerformanceWarning,
             stacklevel=6,
         )
-
-    # Check for chunks from the plan that would violate the user's
-    # configured chunk size.
-    nbytes = utils.parse_bytes(config.get("array.chunk-size"))
-    other_chunks = [chunks[i] for i in range(len(chunks)) if i != axis]
-    other_numel = math.prod(max(x) for x in other_chunks)
-
-    if math.isnan(other_numel) or other_numel == 0:
-        warnsize = maxsize = math.inf
-    else:
-        maxsize = math.ceil(nbytes / (other_numel * itemsize))
-        warnsize = maxsize * 5
-
-    split = config.get("array.slicing.split-large-chunks", None)
-
-    # Warn only when the default is not specified.
-    warned = split is not None
-
-    for _, index_list in plan:
-        if not warned and len(index_list) > warnsize:
-            msg = (
-                "Slicing is producing a large chunk. To accept the large\n"
-                "chunk and silence this warning, set the option\n"
-                "    >>> with dask.config.set(**{'array.slicing.split_large_chunks': False}):\n"
-                "    ...     array[indexer]\n\n"
-                "To avoid creating the large chunks, set the option\n"
-                "    >>> with dask.config.set(**{'array.slicing.split_large_chunks': True}):\n"
-                "    ...     array[indexer]"
-            )
-            warnings.warn(msg, PerformanceWarning, stacklevel=6)
-            warned = True
-
+    assert sum(sum(len(el[1]) for el in subplan) for subplan in plan) == sum(
+        chunks[axis]
+    )
+    # This code is a little wild. Using the products below works really well to
+    # construct the proper input keys for multi dimensional data but product
+    # breaks down if the index_lists is nested.
+    # Therefore, both slices and outdims are just storing indices instead of the
+    # actual slices / input partition and this index has to be resolved later to
+    # the actual value.
+    # This can be particularly confusing for the `inkeys` variable since the
+    # values look like real keys but inkey[axis + 1] is just a pointer to a list
+    # of the real indices
     where_index = []
     index_lists = []
-    for where_idx, index_list in plan:
-        index_length = len(index_list)
-        if split and index_length > maxsize:
-            index_sublist = np.array_split(
-                index_list, math.ceil(index_length / maxsize)
-            )
-            index_lists.extend(index_sublist)
-            where_index.extend([where_idx] * len(index_sublist))
-        else:
-            if not is_arraylike(index_list):
+    for subplan in plan:
+        subwhere_index = []
+        subindex_lists = []
+        index_lists.append(subindex_lists)
+        where_index.append(subwhere_index)
+        for where_idx, index_list in subplan:
+            if not isinstance(index_list, np.ndarray):
                 index_list = np.array(index_list)
-            index_lists.append(index_list)
-            where_index.append(where_idx)
+            subwhere_index.append(where_idx)
+            subindex_lists.append(index_list)
+    del index_list, where_idx, subplan, subindex_lists, subwhere_index
 
     dims = [range(len(bd)) for bd in chunks]
 
-    indims = list(dims)
-    indims[axis] = list(range(len(where_index)))
-    keys = list(product([outname], *indims))
+    key_indices = list(dims)
+    key_indices[axis] = range(len(plan))
+    keys = product([outname], *key_indices)
+
+    slices = [[colon] * len(bd) for bd in chunks]
+    slices[axis] = range(len(index_lists))
+    slices = product(*slices)
 
     outdims = list(dims)
-    outdims[axis] = where_index
-    slices = [[colon] * len(bd) for bd in chunks]
-    slices[axis] = index_lists
-    slices = list(product(*slices))
-    inkeys = list(product([inname], *outdims))
-    values = [(getitem, inkey, slc) for inkey, slc in zip(inkeys, slices)]
+    outdims[axis] = range(len(where_index))
+    inkeys = product([inname], *outdims)
 
     chunks2 = list(chunks)
-    chunks2[axis] = tuple(map(len, index_lists))
-    dsk = dict(zip(keys, values))
+    chunks2[axis] = []
+    dsk = {}
+    for key, inkey, sl in zip(keys, inkeys, slices):
+        keys_indices = []
+        # This is where we're unwrapping the pointers and are constructing the
+        # nested lists
+        for actual_where, actual_slice in zip(
+            where_index[inkey[axis + 1]], index_lists[sl[axis]]
+        ):
+            new_inkey = list(inkey)
+            new_inkey[axis + 1] = actual_where
+            new_inkey = tuple(new_inkey)
 
+            new_slice = list(sl)
+            new_slice[axis] = actual_slice
+            keys_indices.append(new_inkey)
+            keys_indices.append(tuple(new_slice))
+
+        dsk[key] = (multigetitem, axis, *keys_indices)
+
+    chunks2[axis] = tuple(sum(len(el) for el in sublist) for sublist in index_lists)
+    assert sum(chunks2[axis]) == sum(chunks[axis])
     return tuple(chunks2), dsk
+
+
+def multigetitem(axis, *args):
+    shards = []
+    for arr, index in zip(args[::2], args[1::2]):
+        shards.append(arr[index])
+    out = np.concatenate(shards, axis=axis)
+    # TODO: Is this also a copy in case of a single array?
+    # We'll need to copy small slices to avoid holding on to a lot of memory
+    # This is a defensive copy for now...
+    if len(shards) == 1:
+        out = out.copy()
+    return out
 
 
 def posify_index(shape, ind):
