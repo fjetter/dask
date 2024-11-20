@@ -805,12 +805,16 @@ def make_blockwise_graph(
                 args.append(arg)
             else:
                 arg_coords = tuple(coords[c] for c in cmap)
-                tups = lol_product((arg,), arg_coords) if axes else (arg,) + arg_coords
+                if axes:
+                    tups = lol_product((arg,), arg_coords)
+                else:
+                    tups = (arg,) + arg_coords
                 if concatenate and axes:
                     tups = (concatenate, tups, axes)
-                args.append(
-                    io_deps[arg].get(tups[1:], tups[1:]) if arg in io_deps else tups
-                )
+                if arg in io_deps:
+                    args.append(io_deps[arg].get(tups[1:], tups[1:]))
+                else:
+                    args.append(tups)
         return args
 
     dsk = {}
