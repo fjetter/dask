@@ -812,9 +812,8 @@ def make_blockwise_graph(
                 if concatenate and axes:
                     tups = (concatenate, tups, axes)
                 if arg in io_deps:
-                    args.append(io_deps[arg].get(tups[1:], tups[1:]))
-                else:
-                    args.append(tups)
+                    tups = io_deps[arg].get(tups[1:], tups[1:])
+                args.append(tups)
         return args
 
     dsk = {}
