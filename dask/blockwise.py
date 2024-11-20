@@ -800,26 +800,23 @@ def make_blockwise_graph(
 
     def create_args(coords, argpairs, coord_maps, concat_axes, io_deps):
         args = []
-        deps = set()
         for cmap, axes, (arg, ind) in zip(coord_maps, concat_axes, argpairs):
             if ind is None:
                 args.append(arg)
             else:
                 arg_coords = tuple(coords[c] for c in cmap)
                 tups = lol_product((arg,), arg_coords) if axes else (arg,) + arg_coords
-                if arg not in io_deps:
-                    deps.update(flatten(tups) if axes else {tups})
                 if concatenate and axes:
                     tups = (concatenate, tups, axes)
                 args.append(
                     io_deps[arg].get(tups[1:], tups[1:]) if arg in io_deps else tups
                 )
-        return args, deps
+        return args
 
     dsk = {}
     for out_coords in output_blocks:
         coords = out_coords + dummies
-        args, deps = create_args(coords, argpairs, coord_maps, concat_axes, io_deps)
+        args = create_args(coords, argpairs, coord_maps, concat_axes, io_deps)
         dsk[(output,) + out_coords] = (func, *args)
     return dsk
 
