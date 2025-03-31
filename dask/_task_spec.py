@@ -624,6 +624,30 @@ def _get_dependencies(obj: object) -> set | frozenset:
     return _no_deps
 
 
+def _walk_args(obj, _dependencies):
+    dadd = _dependencies.add
+    for o in obj:
+        if isinstance(o, GraphNode):
+            k = o.key
+            dadd(k)
+            if isinstance(o, TaskRef):
+                yield TaskRef(k)
+                continue
+        yield o
+
+
+def _walk_kwargs(obj, _dependencies):
+    dadd = _dependencies.add
+    for k, v in obj.items():
+        if isinstance(v, GraphNode):
+            k = v.key
+            dadd(k)
+            if isinstance(v, Task):
+                yield k, TaskRef(k)
+                continue
+        yield k, v
+
+
 class Task(GraphNode):
     func: Callable
     args: tuple
@@ -649,17 +673,12 @@ class Task(GraphNode):
         self.func = func
         if isinstance(func, Task):
             raise TypeError("Cannot nest tasks")
-        self.args = tuple(
-            Alias(obj.key) if isinstance(obj, TaskRef) else obj for obj in args
-        )
-        self.kwargs = {
-            k: Alias(v.key) if isinstance(v, TaskRef) else v for k, v in kwargs.items()
-        }
-        if _dependencies is None:
+        if _dependencies is None and (args or kwargs):
             _dependencies = set()
-            for a in itertools.chain(self.args, self.kwargs.values()):
-                if isinstance(a, GraphNode):
-                    _dependencies.update(a.dependencies)
+            self.args = tuple(_walk_args(args, _dependencies)) if args else args
+            self.kwargs = (
+                dict(_walk_kwargs(kwargs, _dependencies)) if kwargs else kwargs
+            )
         if _dependencies:
             self._dependencies = frozenset(_dependencies)
         else:
