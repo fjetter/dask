@@ -2334,12 +2334,14 @@ class CounterLock:
         self.release_count = 0
 
     def acquire(self, *args, **kwargs):
+        acq = self.lock.acquire(*args, **kwargs)
+        assert acq
         self.acquire_count += 1
-        return self.lock.acquire(*args, **kwargs)
+        return acq
 
     def release(self, *args, **kwargs):
+        self.lock.release(*args, **kwargs)
         self.release_count += 1
-        return self.lock.release(*args, **kwargs)
 
 
 def test_store_locks_failure_lock_released():
