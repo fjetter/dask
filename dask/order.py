@@ -193,7 +193,7 @@ def order(
     i = 0
 
     runnable_hull = set()
-    reachable_hull = set()
+    reachable_hull: set[Key] = set()
 
     runnable: list[Key] = []
 
@@ -230,9 +230,6 @@ def order(
         nonlocal min_leaf_degree  # type: ignore[misc]
         while next_items:
             item = next_items.pop()
-            runnable_hull.discard(item)
-            reachable_hull.discard(item)
-            leaf_nodes.discard(item)
             if item in result:
                 continue
 
@@ -246,24 +243,30 @@ def order(
                 i += 1
             if item in root_nodes:
                 for leaf in leafs_connected[item]:
-                    if leaf in leaf_nodes:
-                        degree = leafs_degree.pop(leaf)
-                        leafs_per_degree[degree].remove(leaf)
+                    degree = leafs_degree.pop(leaf)
+                    leafs_per_degree[degree].remove(leaf)
+                    if not leafs_per_degree[degree]:
+                        del leafs_per_degree[degree]
 
-                        new_degree = degree - 1
-                        if new_degree > 0:
-                            if new_degree < min_leaf_degree:
-                                min_leaf_degree = new_degree
-                            leafs_per_degree[new_degree].add(leaf)
-                            leafs_degree[leaf] = new_degree
-                        elif not leafs_per_degree[degree]:
-                            assert degree == min_leaf_degree
-                            while min_leaf_degree != max_leaf_degree and (
-                                min_leaf_degree not in leafs_per_degree
-                                or not leafs_per_degree[min_leaf_degree]
-                            ):
-                                min_leaf_degree += 1
+                    new_degree = degree - 1
+                    min_leaf_degree = min(new_degree, min_leaf_degree)
+                    leafs_per_degree[new_degree].add(leaf)
+                    leafs_degree[leaf] = new_degree
+            if item in leaf_nodes and item in leafs_degree:
+                degree = leafs_degree.pop(item)
+                leafs_per_degree[degree].remove(item)
+                if not leafs_per_degree[degree]:
+                    del leafs_per_degree[degree]
+                    assert degree == min_leaf_degree
+                    while min_leaf_degree != max_leaf_degree and (
+                        min_leaf_degree not in leafs_per_degree
+                        or not leafs_per_degree[min_leaf_degree]
+                    ):
+                        min_leaf_degree += 1
 
+            runnable_hull.discard(item)
+            reachable_hull.discard(item)
+            leaf_nodes.discard(item)
             # Note: This is a `set` and therefore this introduces a certain
             # randomness. However, this randomness should not have any impact on
             # the final result since the `process_runnable` should produce
@@ -428,7 +431,7 @@ def order(
         leafs_degree[leaf] = degree
         leafs_per_degree[degree].add(leaf)
 
-    def get_target() -> Key:
+    def get_target(longest_path: bool) -> Key:
         # If we're already mid run and there is a runnable_hull we'll attempt to
         # pick the next target in a way that minimizes the number of additional
         # root nodes that are needed
@@ -437,10 +440,17 @@ def order(
         if not is_trivial_lookup:
             candidates = reachable_hull & leafs_per_degree[min_leaf_degree]
             if not candidates:
-                candidates = leafs_per_degree[min_leaf_degree]
+                if reachable_hull and len(leafs_per_degree[min_leaf_degree]) > 1:
+                    reachable_leafs: set[Key] = set()
+                    for el in reachable_hull:
+                        reachable_leafs.update(leafs_connected[el])
+                    candidates = reachable_leafs & leafs_per_degree[min_leaf_degree]
+                else:
+                    candidates = leafs_per_degree[min_leaf_degree]
             # Even without reachable hull overlap this should be relatively
             # small so one full pass should be fine
-            return min(candidates, key=sort_key)
+            sel = min if not longest_path else max
+            return sel(candidates, key=sort_key)
         else:
             return leaf_nodes_sorted.pop()
 
@@ -564,7 +574,7 @@ def order(
         assert not scrit_path
 
         # A. Build the critical path
-        target = get_target()
+        target = get_target(longest_path)
         next_deps = dependencies[target]
         path_append(target)
 
@@ -760,6 +770,7 @@ OrderInfo = namedtuple(
         "num_data_when_run",
         "num_data_when_released",
         "num_dependencies_freed",
+        "roots_in_memory",
     ),
 )
 
@@ -792,6 +803,8 @@ def diagnostics(
 
     pressure = []
     num_in_memory = 0
+    num_roots_in_memory = 0
+    roots_in_memory = {}
     age = {}
     runpressure = {}
     releasepressure = {}
@@ -800,12 +813,17 @@ def diagnostics(
     for i, key in enumerate(sorted(dsk, key=o.__getitem__)):
         pressure.append(num_in_memory)
         runpressure[key] = num_in_memory
+        roots_in_memory[key] = num_roots_in_memory
         released = 0
+        if not dependencies[key]:
+            num_roots_in_memory += 1
         for dep in dependencies[key]:
             num_needed[dep] -= 1
             if num_needed[dep] == 0:
                 age[dep] = i - o[dep]
                 releasepressure[dep] = num_in_memory
+                if not dependencies[dep]:
+                    num_roots_in_memory -= 1
                 released += 1
         freed[key] = released
         if dependents[key]:
@@ -817,7 +835,12 @@ def diagnostics(
 
     rv = {
         key: OrderInfo(
-            val, age[key], runpressure[key], releasepressure[key], freed[key]
+            val,
+            age[key],
+            runpressure[key],
+            releasepressure[key],
+            freed[key],
+            roots_in_memory[key],
         )
         for key, val in o.items()
     }

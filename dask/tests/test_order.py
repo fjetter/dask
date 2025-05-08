@@ -305,7 +305,7 @@ def test_avoid_broker_nodes(abcde):
     }
     o = order(dsk)
     assert_topological_sort(dsk, o)
-    assert o[(a, 1)] < o[(b, 0)] or (o[(b, 1)] < o[(a, 0)] and o[(b, 2)] < o[(a, 0)])
+    assert o[(a, 1)] < o[(b, 0)] or (o[(b, 1)] > o[(a, 0)] and o[(b, 2)] > o[(a, 0)])
 
 
 @pytest.mark.parametrize("data_root", [True, False])
@@ -2699,3 +2699,38 @@ def test_handle_out_of_graph_dependencies():
     dsk = {t.key: t for t in [tb, tc]}
     o = order(dsk)
     assert len(o) == 2
+
+
+def test_xarray_multiple_variables():
+    # see https://github.com/dask/dask/issues/11641
+    xr = pytest.importorskip("xarray")
+    da = pytest.importorskip("dask.array")
+
+    size = 50
+    ds = xr.Dataset(
+        dict(
+            u=(
+                ["time", "j", "i"],
+                da.random.random((size, 20, 20), chunks=(10, -1, -1)),
+            ),
+            v=(
+                ["time", "j", "i"],
+                da.random.random((size, 20, 20), chunks=(10, -1, -1)),
+            ),
+            w=(
+                ["time", "j", "i"],
+                da.random.random((size, 20, 20), chunks=(10, -1, -1)),
+            ),
+        )
+    )
+
+    ds["uv"] = ds.u * ds.v
+    ds["vw"] = ds.v * ds.w
+
+    ds = ds.fillna(199)
+    ds = ds.count()
+    o = order(collections_to_expr(ds).__dask_graph__())
+    stats, pressure = diagnostics(collections_to_expr(ds).__dask_graph__(), o=o)
+    visualize(collections_to_expr(ds).__dask_graph__(), suffix="new")
+    assert max([st.roots_in_memory for st in stats.values()]) <= 7
+    assert max(pressure) <= 11, pressure
